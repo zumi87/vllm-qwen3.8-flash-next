@@ -223,8 +223,9 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
 
 
-def make_uniform_spec_fixture(n, mode, device):
+def make_uniform_spec_fixture(n, mode, device, num_spec=4):
     """Local tensor-only fixture; no model download or checkpoint loading."""
+    width = num_spec + 1
     from types import SimpleNamespace as NS
 
     from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -234,7 +235,7 @@ def make_uniform_spec_fixture(n, mode, device):
             cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
             max_cudagraph_capture_size=30,
         ),
-        speculative_config=NS(num_speculative_tokens=4, parallel_drafting=False),
+        speculative_config=NS(num_speculative_tokens=num_spec, parallel_drafting=False),
         scheduler_config=NS(max_num_seqs=6),
         parallel_config=NS(decode_context_parallel_size=1),
         cache_config=NS(mamba_cache_mode=mode),
@@ -243,36 +244,41 @@ def make_uniform_spec_fixture(n, mode, device):
     )
     spec = MambaSpec(
         block_size=472, shapes=((16, 64),), dtypes=(torch.float32,),
-        num_speculative_blocks=4,
+        num_speculative_blocks=num_spec,
     )
     builder = GDNAttentionMetadataBuilder(spec, ["layer.0"], config, device)
-    query_cpu = torch.arange(0, (n + 1) * 5, 5, dtype=torch.int32)
-    columns = 80 if mode == "align" else 5
+    query_cpu = torch.arange(0, (n + 1) * width, width, dtype=torch.int32)
+    columns = 80 if mode == "align" else width
     table = torch.arange(n * columns, dtype=torch.int32, device=device).view(n, -1)
     lengths = torch.tensor([0, 1, 471, 472, 473, 32768][:n],
                            dtype=torch.int32, device=device)
     common = CommonAttentionMetadata(
         query_start_loc=query_cpu.to(device), query_start_loc_cpu=query_cpu,
-        seq_lens=lengths, num_reqs=n, num_actual_tokens=n * 5,
-        max_query_len=5, max_seq_len=32768, block_table_tensor=table,
-        slot_mapping=torch.zeros(n * 5, dtype=torch.int64, device=device),
+        seq_lens=lengths, num_reqs=n, num_actual_tokens=n * width,
+        max_query_len=width, max_seq_len=32768, block_table_tensor=table,
+        slot_mapping=torch.zeros(n * width, dtype=torch.int64, device=device),
     )
-    accepted = torch.arange(n, dtype=torch.int32, device=device) % 5 + 1
-    drafts = torch.full((n,), 4, dtype=torch.int32)
+    accepted = torch.arange(n, dtype=torch.int32, device=device) % width + 1
+    drafts = torch.full((n,), num_spec, dtype=torch.int32)
     return builder, common, accepted, drafts
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA staging kernel")
 @pytest.mark.parametrize("n", [1, 2, 3, 4, 5, 6])
 @pytest.mark.parametrize("mode", ["none", "align"])
-def test_fused_spec_metadata_matches_native_and_graph_replay(n, mode, monkeypatch):
+@pytest.mark.parametrize("num_spec", [1, 2, 3, 4])
+def test_fused_spec_metadata_matches_native_and_graph_replay(
+    n, mode, num_spec, monkeypatch
+):
     """State selection, accepted counts and captured pointers survive row updates."""
     from dataclasses import fields
 
     from vllm.v1.attention.backends import flash_gdn_spec_metadata as fused
 
     device = torch.device("cuda", torch.cuda.current_device())
-    builder, common, accepted, drafts = make_uniform_spec_fixture(n, mode, device)
+    builder, common, accepted, drafts = make_uniform_spec_fixture(
+        n, mode, device, num_spec
+    )
     monkeypatch.setattr(fused, "ENABLED", False)
 
     def snapshot(meta):
@@ -291,7 +297,7 @@ def test_fused_spec_metadata_matches_native_and_graph_replay(n, mode, monkeypatc
         if iteration:
             common.block_table_tensor.add_(7)
             common.seq_lens.copy_(torch.roll(common.seq_lens, 1))
-            accepted.copy_(accepted % 5 + 1)
+            accepted.copy_(accepted % (num_spec + 1) + 1)
             monkeypatch.setattr(fused, "ENABLED", False)
             reference = snapshot(builder.build(0, common, accepted, drafts))
             monkeypatch.setattr(fused, "ENABLED", True)

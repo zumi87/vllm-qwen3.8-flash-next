@@ -47,7 +47,7 @@ def try_build(builder, metadata, metadata_cls, accepted, draft_counts, fast_buil
     mode = builder.vllm_config.cache_config.mamba_cache_mode
     if (
         fast_build or not builder.use_spec_decode or not builder.use_full_cuda_graph
-        or n not in (1, 2, 3, 4, 5, 6) or width != 5
+        or n not in (1, 2, 3, 4, 5, 6) or not 2 <= width <= 5
         or mode not in ("none", "align")
         or metadata.max_query_len != width
         or metadata.num_actual_tokens != n * width

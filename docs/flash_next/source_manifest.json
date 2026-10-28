@@ -3,6 +3,8 @@
   "validated_image_id": "sha256:0f75571247e58cfe09d11fe9c6d5dce6b7e2c7da9dfeb6c3e1a2607a7c7e5599",
   "hc_injection_mtp_note": "Default-off M5--16 HC injection extension is experimental. Operator, whole-layer and registered-op GPU/fake/compile checks passed. TP4 Q8 MTP1--4 and the matched-cache no-MTP control passed 180 timing batches and 290 bounded concurrent behavior answers. Recommend depth3 for the tested equally weighted math/code/prose C2--4 mix:49.50% gain versus matched no-MTP, compared with29.53/44.75/47.15% for depths1/2/4. Small margins are not statistical separation. Selected depth3 and control passed C1 padded-context checks through32K. Q8 means draft-expert INT8 weights/BF16 activations, not whole-head W8A8. Intermittent C1 timing variation remains unresolved. No production promotion or240K qualification. See hc-inject-mtp.md.",
   "post_snapshot_sources": {
+    "vllm/models/qwen4_exp/nvidia/ops/qsa_verify_staging.py": "c9b08d8bb85febc0628f3c03d31b1ae851449c208befed408e4dc8ccc5ede4e9",
+    "vllm/v1/attention/backends/flash_gdn_spec_metadata.py": "caeea6f31647bea295353b9ede5a60df34a1c1a3488d7a22fa6a2d77f4a9bac2",
     "vllm/models/qwen4_exp/nvidia/flash_gdn_input_tensor_sm86.py": "2b1653301abac72edc64d5b928fb815489291fdb6095eb7e6a2d963382d58299",
     "vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py": "641e9d0e867e37bbd9d1905feca4098ad554aa0da45bf44b377c17bf87e970d8",
     "vllm/v1/kv_offload/cpu/gpu_worker.py": "7123ea883a75ea5eecee042203ab802e2751af7211e9fb7f2b31a6bde92a714d",

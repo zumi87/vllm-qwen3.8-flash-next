@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Optional packed host-KV staging for uniform TP4 MTP4 verification."""
+"""Optional packed host-KV staging for uniform TP4 MTP1-4 verification."""
 
 import torch
 
@@ -38,9 +38,10 @@ def _pack(
     INDEX_STRIDE: tl.constexpr,
     WIDTH: tl.constexpr,
     MAX_UNION: tl.constexpr,
+    ROWS: tl.constexpr,
 ):
     row = tl.program_id(1)
-    request = row // 5
+    request = row // ROWS
     count = tl.load(INDICES + row * INDEX_STRIDE + WIDTH)
     if tl.program_id(0) * 4 < count:
         column = tl.program_id(0) * 4 + tl.arange(0, 4)
@@ -77,12 +78,15 @@ def _remap(
     STRIDE: tl.constexpr,
     WIDTH: tl.constexpr,
     TILE: tl.constexpr,
+    ROWS: tl.constexpr,
 ):
     row = tl.program_id(1)
     column = tl.program_id(0) * TILE + tl.arange(0, TILE)
     token = tl.load(INDICES + row * STRIDE + column, column <= WIDTH, other=-1)
     valid = (column < WIDTH) & (token >= 0) & (token < CAPACITY)
-    mapped = tl.load(MAP + row // 5 * CAPACITY + tl.maximum(token, 0), valid, other=-1)
+    mapped = tl.load(
+        MAP + row // ROWS * CAPACITY + tl.maximum(token, 0), valid, other=-1
+    )
     tl.store(
         REMAPPED + row * (WIDTH + 1) + column,
         tl.where(column == WIDTH, token, mapped),
@@ -96,7 +100,7 @@ _LOGGER = init_logger(__name__)
 
 
 def try_verify_staging(layer, query, cache, indices, metadata, output) -> bool:
-    """Write uniform five-row verification output, or leave it untouched.
+    """Write uniform 2-5 row verification output, or leave it untouched.
 
     The arena and scratch are shared across sequential layers on the model's
     compute stream. No cache contents or ownership metadata are modified.
@@ -108,7 +112,8 @@ def try_verify_staging(layer, query, cache, indices, metadata, output) -> bool:
     rows = metadata.num_actual_tokens
     table = metadata.block_table
     requests = metadata.seq_lens.shape[0]
-    if metadata.max_query_len == 5:
+    per_request = metadata.max_query_len
+    if 2 <= per_request <= 5:
         signature = (
             tuple(query.shape),
             tuple(cache.shape),
@@ -128,9 +133,9 @@ def try_verify_staging(layer, query, cache, indices, metadata, output) -> bool:
             )
     # Sum(query lengths) == requests * max_query_len proves uniformity.
     if (
-        metadata.max_query_len != 5
+        not 2 <= per_request <= 5
         or not 1 <= requests <= 4
-        or rows != requests * 5
+        or rows != requests * per_request
         or table.shape[0] < requests
         or metadata.query_start_loc.shape[0] < requests + 1
         or query.shape != (rows, 6, 256)
@@ -152,7 +157,7 @@ def try_verify_staging(layer, query, cache, indices, metadata, output) -> bool:
     logical_pages, page = table.shape[1], cache.shape[2]
     capacity = logical_pages * page
     width = indices.shape[1] - 1
-    max_union = width * 5
+    max_union = width * per_request
     pages = triton.cdiv(requests * max_union, page)
     arena_bytes = getattr(layer, "_qsa_stage_arena_bytes", 0)
     if (
@@ -168,7 +173,7 @@ def try_verify_staging(layer, query, cache, indices, metadata, output) -> bool:
     if ("active",) not in _REPORTED:
         _REPORTED.add(("active",))
         _LOGGER.info("QSA verification staging active; reusing existing arena")
-    key = (cache.device, requests, capacity, page, width)
+    key = (cache.device, requests, per_request, capacity, page, width)
     if key not in _SCRATCH:
         _SCRATCH[key] = (
             torch.empty((requests, capacity), device=cache.device, dtype=torch.int32),
@@ -198,10 +203,11 @@ def try_verify_staging(layer, query, cache, indices, metadata, output) -> bool:
         indices.stride(0),
         width,
         max_union,
+        per_request,
         num_warps=4,
     )
     _remap[(triton.cdiv(width + 1, 256), rows)](
-        indices, mapping, remapped, capacity, indices.stride(0), width, 256
+        indices, mapping, remapped, capacity, indices.stride(0), width, 256, per_request
     )
     keys, values = arena[:pages].transpose(1, 2).split(256, dim=-1)
     qsa_sparse_paged_attention(
