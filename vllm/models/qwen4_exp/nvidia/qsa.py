@@ -55,6 +55,7 @@ from vllm.v1.kv_cache_interface import (
 from ..common.qsa_cache import QSAForwardMetadata
 from . import model
 from .indexer_qsa import QSAIndexer
+from .ops.qsa import QSA_FP8_KV_DTYPES
 
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -67,7 +68,12 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
     """FullAttentionSpec backend used by the merged QSA owner."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16"]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+    ]
 
     @staticmethod
     def get_name() -> str:
@@ -96,6 +102,8 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
 
 
 _QSA_STAGE_MIN_ROWS = 64
+# Per-tensor e4m3 main K/V, decoded in the Triton kernels (SM86 has no FP8 MMA).
+_QSA_KV_CACHE_DTYPES = ("auto", "bfloat16", "fp8", "fp8_e4m3")
 _QSA_PREFILL_METADATA_STATS = {"reads": 0, "hits": 0}
 
 
@@ -173,7 +181,9 @@ def _qsa_staged_prefill(
 
     from .ops.qsa import qsa_get_staging_arena, qsa_sparse_paged_attention_staged
 
-    arena = qsa_get_staging_arena(kv_cache, getattr(layer, "_qsa_stage_arena_bytes", 0))
+    arena = qsa_get_staging_arena(
+        kv_cache, getattr(layer, "_qsa_stage_arena_bytes", 0), torch.bfloat16
+    )
     if arena is None:
         return None
     for request, start, end, max_page in ranges:
@@ -188,6 +198,8 @@ def _qsa_staged_prefill(
             arena,
             use_prefill_config,
             output[:num_tokens],
+            layer._k_scale_float,
+            layer._v_scale_float,
         )
     return [(start, end) for _, start, end, _ in ranges]
 
@@ -198,16 +210,42 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
     supports_dcp: bool = False
     supports_pcp: bool = False
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        num_kv_heads: int,
+        alibi_slopes: list[float] | None,
+        sliding_window: int | None,
+        kv_cache_dtype: str,
+        *args,
+        **kwargs,
+    ) -> None:
+        # QSA never runs FlashAttention over the cache, so FA's FP8 KV device
+        # check does not apply; the QSA kernels handle the storage dtype.
+        super().__init__(
+            num_heads,
+            head_size,
+            scale,
+            num_kv_heads,
+            alibi_slopes,
+            sliding_window,
+            "auto",
+            *args,
+            **kwargs,
+        )
+        self.kv_cache_dtype = kv_cache_dtype
         if not is_flash_attn_varlen_func_available():
             raise NotImplementedError("Qwen4Exp QSA requires FlashAttention")
         if self.dcp_world_size != 1:
             raise NotImplementedError(
                 "Qwen4Exp QSA does not support decode context parallelism"
             )
-        if self.kv_cache_dtype not in ("auto", "bfloat16"):
-            raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")
+        if self.kv_cache_dtype not in _QSA_KV_CACHE_DTYPES:
+            raise NotImplementedError(
+                "Qwen4Exp QSA requires a BF16 or e4m3 main KV cache"
+            )
         self.supports_quant_query_input = False
 
     def forward_qsa(
@@ -242,9 +280,15 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise RuntimeError("QSA owner did not provide its top-k buffer")
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
+        if query.dtype != torch.bfloat16 or kv_cache.dtype not in (
+            torch.bfloat16,
+            *QSA_FP8_KV_DTYPES,
+        ):
+            raise NotImplementedError("Qwen4Exp QSA requires BF16 Q and BF16/e4m3 K/V")
+        if kv_cache.dtype in QSA_FP8_KV_DTYPES:
+            kv_cache = kv_cache.view(torch.uint8)
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
-        if key_cache.dtype != torch.bfloat16 or query.dtype != torch.bfloat16:
-            raise NotImplementedError("Qwen4Exp QSA requires BF16 Q/K/V")
+        scales = dict(k_scale=layer._k_scale_float, v_scale=layer._v_scale_float)
 
         from .ops.qsa import qsa_sparse_paged_attention
 
@@ -282,6 +326,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 token_to_req,
                 use_prefill_config,
                 output[:num_tokens],
+                **scales,
             )
             return output
         low = 0
@@ -296,6 +341,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                     token_to_req[low:high],
                     use_prefill_config,
                     output[low:high],
+                    **scales,
                 )
             low = end
         return output
@@ -323,8 +369,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
         if model_config.dtype != torch.bfloat16:
             raise NotImplementedError("Qwen4Exp QSA currently requires BF16")
-        if cache_config.cache_dtype not in ("auto", "bfloat16"):
-            raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")
+        if cache_config.cache_dtype not in _QSA_KV_CACHE_DTYPES:
+            raise NotImplementedError(
+                "Qwen4Exp QSA requires a BF16 or e4m3 main KV cache"
+            )
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
         parallel_config = vllm_config.parallel_config
@@ -423,8 +471,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
-        if self.kv_cache_torch_dtype != torch.bfloat16:
-            raise NotImplementedError("Qwen4Exp QSA requires BF16 cache storage")
+        # vLLM stores "fp8"/"fp8_e4m3" caches as uint8 bytes.
+        if self.kv_cache_torch_dtype not in (torch.bfloat16, *QSA_FP8_KV_DTYPES):
+            raise NotImplementedError("Qwen4Exp QSA requires BF16 or e4m3 storage")
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         self._qsa_kv_offload = os.environ.get("VLLM_QSA_KV_OFFLOAD", "0") == "1"
@@ -500,10 +549,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             self.num_kv_heads,
             None,
             None,
-            self.kv_cache_dtype,
-            None,
-            AttentionType.DECODER,
-            None,
+            kv_cache_dtype=self.kv_cache_dtype,
+            logits_soft_cap=None,
+            attn_type=AttentionType.DECODER,
+            kv_sharing_target_layer_name=None,
         )
         self.indexer = QSAIndexer(
             vllm_config=vllm_config,
@@ -576,12 +625,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if kv_cache.device.type == "cpu":
             if (
                 not kv_cache.is_pinned()
-                or kv_cache.dtype != torch.bfloat16
+                or kv_cache.dtype != self.kv_cache_torch_dtype
                 or kv_cache.ndim != 4
                 or kv_cache.shape[1] != self.num_kv_heads
                 or kv_cache.shape[3] != 2 * self.head_dim
             ):
-                raise ValueError("QSA resident host KV requires pinned BF16 real pages")
+                raise ValueError("QSA resident host KV requires pinned real pages")
             # Allocation and its byte ceiling belong to the native host pool.
             # Keep the exact view alive: no second host copy or GPU placeholder.
             self._qsa_host_kv = kv_cache
@@ -592,9 +641,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise ValueError("QSA host KV expected [blocks, 1, tokens, 1] GPU slots")
         num_blocks, _, block_size, _ = kv_cache.shape
         shape = (num_blocks, self.num_kv_heads, block_size, 2 * self.head_dim)
+        element_bytes = self.kv_cache_torch_dtype.itemsize
         layer_bytes = (
-            num_blocks * self.num_kv_heads * block_size * 2 * self.head_dim * 2
-        )
+            num_blocks * self.num_kv_heads * block_size * 2 * self.head_dim
+        ) * element_bytes
         # Pinned allocations may be rounded to power-of-two allocator bins.
         # Budget conservatively for all TP ranks, not only this local shard.
         reserved_layer_bytes = 1 << (max(1, layer_bytes) - 1).bit_length()
@@ -610,7 +660,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 "Reduce --kv-cache-memory-bytes or --num-gpu-blocks-override."
             )
         self._qsa_host_kv = torch.empty(
-            shape, dtype=torch.bfloat16, device="cpu", pin_memory=True
+            shape, dtype=self.kv_cache_torch_dtype, device="cpu", pin_memory=True
         )
         self._qsa_gpu_slots = kv_cache
         self.kv_cache = get_accelerator_view_from_cpu_tensor(self._qsa_host_kv)

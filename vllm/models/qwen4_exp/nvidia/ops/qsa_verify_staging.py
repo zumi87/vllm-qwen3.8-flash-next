@@ -8,7 +8,11 @@ from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.block_table import get_block_table_width
 
-from .qsa import qsa_get_staging_arena, qsa_sparse_paged_attention
+from .qsa import (
+    QSA_FP8_KV_DTYPES,
+    qsa_get_staging_arena,
+    qsa_sparse_paged_attention,
+)
 
 
 @triton.jit
@@ -145,7 +149,7 @@ def try_verify_staging(layer, query, cache, indices, metadata, output) -> bool:
         or cache.stride(3) != 1
         or cache.stride(2) != 512
         or cache.stride(0) < cache.shape[2] * 512
-        or cache.dtype != torch.bfloat16
+        or cache.dtype not in (torch.bfloat16, *QSA_FP8_KV_DTYPES)
         or query.dtype != torch.bfloat16
         or not cache.is_cuda
         or indices.shape != (rows, 2052)
@@ -163,9 +167,11 @@ def try_verify_staging(layer, query, cache, indices, metadata, output) -> bool:
     if (
         logical_pages < 1
         or logical_pages > get_block_table_width(triton.cdiv(32768, page), page)
-        or pages * page * 1024 > arena_bytes
+        or pages * page * 512 * cache.element_size() > arena_bytes
     ):
         return False
+    if cache.dtype in QSA_FP8_KV_DTYPES:
+        cache = cache.view(torch.uint8)
     arena = qsa_get_staging_arena(cache, arena_bytes)
     if arena is None:
         return False
@@ -211,6 +217,15 @@ def try_verify_staging(layer, query, cache, indices, metadata, output) -> bool:
     )
     keys, values = arena[:pages].transpose(1, 2).split(256, dim=-1)
     qsa_sparse_paged_attention(
-        query, keys, values, remapped, local_table, local_ids, False, output
+        query,
+        keys,
+        values,
+        remapped,
+        local_table,
+        local_ids,
+        False,
+        output,
+        k_scale=layer._k_scale_float,
+        v_scale=layer._v_scale_float,
     )
     return True

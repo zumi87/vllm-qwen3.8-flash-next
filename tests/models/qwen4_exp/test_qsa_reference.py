@@ -24,6 +24,56 @@ requires_qsa_kernels = pytest.mark.skipif(
 )
 
 
+@requires_qsa_kernels
+@pytest.mark.parametrize("rows", [1, 4, 20, 33])
+@pytest.mark.parametrize("pattern", ["ties", "equal", "distinct", "ulp"])
+def test_qsa_deterministic_topk_preserves_scores_and_breaks_ties(
+    monkeypatch, rows, pattern
+):
+    """Match exact stable top-k, including ragged visibility and dirty padding."""
+    monkeypatch.setenv("VLLM_FLASH_QSA_DETERMINISTIC_TOPK", "1")
+    width, k = 8192, 512
+    torch.manual_seed(17)
+    logits = torch.randint(0, 16, (rows, width + 16), device="cuda").float()
+    logits = logits[:, :width]  # Non-contiguous row stride.
+    if pattern == "equal":
+        logits.fill_(0)
+    elif pattern == "distinct":
+        logits.copy_(torch.rand_like(logits))
+    elif pattern == "ulp":
+        logits.copy_(1 + logits * torch.finfo(torch.float32).eps)
+    visible = torch.tensor(
+        ([8192, 0, 511, 512, 513, 4097, 8000] * (rows // 7 + 1))[:rows],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    columns = torch.arange(width, device="cuda")
+    valid = columns[None, :] < visible[:, None]
+    logits.masked_fill_(~valid, float("nan"))
+    masked = logits.masked_fill(~valid, -torch.inf)
+    expected = masked.argsort(dim=-1, descending=True, stable=True)[:, :k]
+    expected = (
+        torch.where(torch.arange(k, device="cuda") < visible[:, None], expected, width)
+        .sort(dim=-1)
+        .values
+    )
+    expected = torch.where(expected == width, -1, expected).int()
+    selected = torch.empty((rows, k), device="cuda", dtype=torch.int32)
+    workspace = torch.empty(1024 * 1024, device="cuda", dtype=torch.uint8)
+    for _ in range(3):
+        selected.fill_(-123)
+        qsa_indexer_ops._topk(logits, visible, 2048, 4, selected, workspace)
+        torch.testing.assert_close(selected, expected, rtol=0, atol=0)
+
+    # Capture must not depend on host reads or a one-time output allocation.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=torch.cuda.Stream(device=logits.device)):
+        qsa_indexer_ops._topk(logits, visible, 2048, 4, selected, workspace)
+    selected.fill_(-123)
+    graph.replay()
+    torch.testing.assert_close(selected, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("enabled,graph", [(False, False), (True, False), (True, True)])
 def test_qsa_prefill_metadata_cache_expires_with_forward_context(
     monkeypatch, enabled, graph
@@ -970,7 +1020,33 @@ def test_qsa_block_expansion_correctness() -> None:
     assert actual[:, 11].tolist() == [6, 11]
 
 
+def _quantize_kv(
+    kv_cache: torch.Tensor,
+    kv_dtype: torch.dtype,
+    scale: float,
+    v_scale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (stored, BF16 reference) caches for power-of-two e4m3 scales.
+
+    ``scale`` applies to K (the first half of the last dim) and, unless
+    ``v_scale`` is given, to V. Works in place on ``kv_cache``, which becomes
+    the exact dequantized reference, to keep the large production-geometry
+    cases within memory.
+    """
+    if kv_dtype == torch.bfloat16:
+        return kv_cache, kv_cache
+    head_dim = kv_cache.shape[-1] // 2
+    scale = torch.tensor(
+        [scale] * head_dim + [scale if v_scale is None else v_scale] * head_dim,
+        dtype=kv_cache.dtype,
+        device=kv_cache.device,
+    )
+    stored = kv_cache.div_(scale).to(kv_dtype)
+    return stored, kv_cache.copy_(stored).mul_(scale)
+
+
 @requires_qsa_kernels
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
     (
         "num_rows",
@@ -1004,6 +1080,7 @@ def test_qsa_sparse_paged_attention_correctness(
     page_size: int,
     use_prefill_config: bool,
     num_requests: int,
+    kv_dtype: torch.dtype,
 ) -> None:
     torch.manual_seed(2)
     head_dim = 256
@@ -1025,7 +1102,10 @@ def test_qsa_sparse_paged_attention_correctness(
         device="cuda",
         dtype=torch.bfloat16,
     )
+    kv_scale = 0.5
+    kv_cache, reference_kv_cache = _quantize_kv(kv_cache, kv_dtype, kv_scale)
     k_cache, v_cache = kv_cache.split(head_dim, dim=-1)
+    reference_k_cache, reference_v_cache = reference_kv_cache.split(head_dim, dim=-1)
     block_table = (
         torch.randperm(num_cache_blocks, device="cuda")
         .reshape(num_requests, num_pages_per_request)
@@ -1096,11 +1176,13 @@ def test_qsa_sparse_paged_attention_correctness(
         block_table,
         token_to_req,
         use_prefill_config=use_prefill_config,
+        k_scale=kv_scale,
+        v_scale=kv_scale,
     )
     expected = _qsa_sparse_paged_attention_reference(
         q,
-        k_cache,
-        v_cache,
+        reference_k_cache,
+        reference_v_cache,
         logical_indices[:, :selection_width],
         block_table,
         token_to_req,
@@ -1116,8 +1198,9 @@ def test_qsa_sparse_paged_attention_correctness(
 )
 @pytest.mark.parametrize("arena_pages", [1, 8])
 @pytest.mark.parametrize("cache_metadata", [False, True])
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_qsa_multi_request_staging_preserves_private_suffix_and_ram_bytes(
-    monkeypatch, query_counts, arena_pages, cache_metadata
+    monkeypatch, query_counts, arena_pages, cache_metadata, kv_dtype
 ):
     """Exercise the real dispatch/kernels with shared pages and private suffixes."""
     from vllm.forward_context import ForwardContext, override_forward_context
@@ -1132,14 +1215,30 @@ def test_qsa_multi_request_staging_preserves_private_suffix_and_ram_bytes(
         [1, *range(2 + i * (pages - 1), 2 + (i + 1) * (pages - 1))]
         for i in range(len(query_counts))
     ]
-    backing = torch.randn(
-        2 + len(query_counts) * (pages - 1),
-        1,
-        page_size,
-        2 * head_dim,
-        dtype=torch.bfloat16,
+    k_scale, v_scale = 0.25, 2.0
+    backing, reference_backing = _quantize_kv(
+        torch.randn(
+            2 + len(query_counts) * (pages - 1),
+            1,
+            page_size,
+            2 * head_dim,
+            dtype=torch.bfloat16,
+        ),
+        kv_dtype,
+        k_scale,
+        v_scale,
+    )
+    # The direct-host pool packs layers block-outermost: each layer's pages
+    # are a strided view, not a contiguous tensor.
+    packed_layers = torch.empty(
+        (backing.shape[0], 2, *backing.shape[1:]),
+        dtype=backing.dtype,
         pin_memory=True,
     )
+    packed_layers.view(torch.uint8).fill_(0x7F)  # e4m3 NaN / huge BF16
+    packed_layers[:, 1] = backing
+    backing = packed_layers[:, 1]
+    assert backing.stride(0) == 2 * backing[0].numel()
     before = backing.view(torch.uint8).clone()
     cache = get_accelerator_view_from_cpu_tensor(backing)
     total = sum(query_counts)
@@ -1176,6 +1275,8 @@ def test_qsa_multi_request_staging_preserves_private_suffix_and_ram_bytes(
         _qsa_stage_all_prefill=False,
         _qsa_stage_arena_bytes=arena_pages * page_size * 2 * head_dim * 2,
         topk_indices_buffer=packed,
+        _k_scale_float=k_scale,
+        _v_scale_float=v_scale,
     )
     impl = SimpleNamespace(
         alibi_slopes=None,
@@ -1223,7 +1324,7 @@ def test_qsa_multi_request_staging_preserves_private_suffix_and_ram_bytes(
         assert call[0] == list(range(starts[request], starts[request + 1]))
         assert call[1] == tables[request]
     assert len({call[2] for call in calls}) <= 1
-    reference_cache = backing.to("cuda")
+    reference_cache = reference_backing.to("cuda")
     keys, values = reference_cache.transpose(1, 2).split(head_dim, dim=-1)
     expected = _qsa_sparse_paged_attention_reference(
         query, keys, values, selected, table, request_ids, head_dim**-0.5
@@ -1355,6 +1456,109 @@ def test_qsa_unused_poisoned_pages_do_not_leak_into_direct_or_staged_attention(
         False,
     )
     assert not bool(torch.isfinite(bad[0]).all())
+
+
+@requires_qsa_kernels
+# vLLM allocates "fp8" caches as uint8; tests elsewhere use float8_e4m3fn views.
+@pytest.mark.parametrize("storage", [torch.uint8, torch.float8_e4m3fn])
+def test_qsa_fp8_cache_update_writes_saturated_e4m3_into_host_pages(storage) -> None:
+    """The native FP8 cache writer must fill the UVA host layout QSA decodes."""
+    from vllm import _custom_ops as ops
+    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+    torch.manual_seed(5)
+    page_size, head_dim, scale, rows = 16, 256, 0.5, 20
+    backing = torch.zeros(
+        (4, 1, page_size, 2 * head_dim), dtype=storage, pin_memory=True
+    )
+    cache = get_accelerator_view_from_cpu_tensor(backing)
+    key = torch.randn(rows, 1, head_dim, device="cuda", dtype=torch.bfloat16) * 8
+    value = torch.randn_like(key) * 8
+    # Saturation and underflow, not NaN, at the e4m3 range limits.
+    key[0, 0, :4] = torch.tensor([1000.0, -1000.0, 1e-4, 0.0])
+    slots = torch.randperm(4 * page_size, device="cuda")[:rows]
+    scales = torch.tensor(scale, device="cuda")
+    key_cache, value_cache = cache.transpose(1, 2).split(head_dim, dim=-1)
+    ops.reshape_and_cache_flash(
+        key, value, key_cache, value_cache, slots, "fp8", scales, scales
+    )
+    torch.cuda.synchronize()
+    stored = backing.view(torch.float8_e4m3fn).to("cuda").float()
+    for source, offset in ((key, 0), (value, head_dim)):
+        actual = stored[slots // page_size, 0, slots % page_size][
+            :, offset : offset + head_dim
+        ]
+        expected = (source[:, 0].float() / scale).clamp(-448, 448)
+        torch.testing.assert_close(actual, expected, rtol=2**-4, atol=2**-9)
+
+
+@requires_qsa_kernels
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 6),
+    reason="verify staging is SM86-only",
+)
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize(("requests", "per_request"), [(1, 5), (4, 5), (2, 2)])
+def test_verify_staging_matches_direct_attention(kv_dtype, requests, per_request):
+    """Packed verify staging must reproduce direct host-KV attention."""
+    from vllm.models.qwen4_exp.nvidia.ops.qsa_verify_staging import try_verify_staging
+    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+    torch.manual_seed(11)
+    page, context, width, scale = 472, 3000, 2051, 0.25
+    logical_pages = math.ceil(context / page)
+    backing, _ = _quantize_kv(
+        torch.randn(1 + requests * logical_pages, 1, page, 512, dtype=torch.bfloat16),
+        kv_dtype,
+        scale,
+    )
+    if kv_dtype != torch.bfloat16:
+        backing = backing.view(torch.uint8)  # production "fp8" storage
+    cache = get_accelerator_view_from_cpu_tensor(backing.pin_memory())
+    table = (
+        (1 + torch.randperm(requests * logical_pages, device="cuda"))
+        .view(requests, logical_pages)
+        .int()
+    )
+    rows = requests * per_request
+    query = torch.randn(rows, 6, 256, dtype=torch.bfloat16, device="cuda")
+    indices = torch.full((rows, width + 1), -1, dtype=torch.int32, device="cuda")
+    for row in range(rows):
+        count = 1500 + 100 * (row % per_request)
+        indices[row, :count] = torch.randperm(context, device="cuda")[:count]
+        indices[row, width] = count
+    metadata = SimpleNamespace(
+        num_actual_tokens=rows,
+        max_query_len=per_request,
+        seq_lens=torch.full((requests,), context, device="cuda", dtype=torch.int32),
+        query_start_loc=torch.arange(
+            0, rows + 1, per_request, device="cuda", dtype=torch.int32
+        ),
+        block_table=table,
+    )
+    layer = SimpleNamespace(
+        _qsa_verify_staging=True,
+        _qsa_kv_offload=True,
+        _qsa_stage_arena_bytes=64 * 2**20,
+        _k_scale_float=scale,
+        _v_scale_float=scale,
+    )
+    output = torch.full_like(query, float("nan"))
+    assert try_verify_staging(layer, query, cache, indices, metadata, output)
+    storage = cache.view(torch.uint8) if kv_dtype != torch.bfloat16 else cache
+    keys, values = storage.transpose(1, 2).split(256, dim=-1)
+    expected = qsa_ops.qsa_sparse_paged_attention(
+        query,
+        keys,
+        values,
+        indices,
+        table,
+        torch.arange(rows, device="cuda", dtype=torch.int32) // per_request,
+        False,
+        k_scale=scale,
+        v_scale=scale,
+    )
+    torch.testing.assert_close(output, expected)
 
 
 @requires_qsa_kernels
